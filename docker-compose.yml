@@ -48,6 +48,8 @@ services:
     depends_on:
       - plane-db
       - plane-redis
+    ports:
+      - "${API_LISTEN_PORT}:8000"
 
   worker:
     container_name: bgworker
