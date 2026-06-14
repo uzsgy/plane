@@ -37,6 +37,21 @@ export class IssueService extends APIService {
       });
   }
 
+  async importIssuesFromCsv(
+    workspaceSlug: string,
+    projectId: string,
+    file: File
+  ): Promise<{ created: number; failed: number; errors: { row: number; error: string }[] }> {
+    const formData = new FormData();
+    formData.append("file", file);
+
+    return this.post(`/api/workspaces/${workspaceSlug}/projects/${projectId}/issues/import-csv/`, formData)
+      .then((response) => response?.data)
+      .catch((error) => {
+        throw error?.response?.data;
+      });
+  }
+
   async getIssuesFromServer(
     workspaceSlug: string,
     projectId: string,

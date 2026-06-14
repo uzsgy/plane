@@ -31,6 +31,7 @@ from plane.app.views import (
     WorkItemDescriptionVersionEndpoint,
     IssueMetaEndpoint,
     IssueDetailIdentifierEndpoint,
+    IssueCsvImportEndpoint,
 )
 
 urlpatterns = [
@@ -43,6 +44,11 @@ urlpatterns = [
         "workspaces/<str:slug>/projects/<uuid:project_id>/issues/",
         IssueViewSet.as_view({"get": "list", "post": "create"}),
         name="project-issue",
+    ),
+    path(
+        "workspaces/<str:slug>/projects/<uuid:project_id>/issues/import-csv/",
+        IssueCsvImportEndpoint.as_view(),
+        name="project-issue-import-csv",
     ),
     path(
         "workspaces/<str:slug>/projects/<uuid:project_id>/issues-detail/",
