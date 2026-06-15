@@ -6,6 +6,7 @@ import csv
 import io
 from datetime import datetime
 
+from django.utils import timezone
 from django.utils.dateparse import parse_date
 from rest_framework import status
 from rest_framework.response import Response
@@ -13,7 +14,7 @@ from rest_framework.response import Response
 from plane.app.permissions import ROLE, allow_permission
 from plane.app.serializers import IssueCreateSerializer
 from plane.app.views import BaseAPIView
-from plane.db.models import Label, Project, ProjectMember, State
+from plane.db.models import Cycle, CycleIssue, Label, Module, ModuleIssue, Project, ProjectMember, State
 
 MAX_IMPORT_ROWS = 200
 
@@ -26,6 +27,8 @@ FIELD_ALIASES = {
     "assignees": {"assignees", "assignee_emails"},
     "start_date": {"start_date"},
     "target_date": {"target_date", "due_date"},
+    "module": {"module", "module_name", "modules"},
+    "cycle": {"cycle", "cycle_name"},
 }
 
 VALID_PRIORITIES = {"urgent", "high", "medium", "low", "none"}
@@ -65,6 +68,55 @@ def _parse_date(value: str):
     return None
 
 
+def _link_issue_to_modules(issue, module_names_value, modules_by_name, project_id, workspace_id):
+    if not module_names_value:
+        return
+
+    module_issues = []
+    seen_module_ids = set()
+
+    for module_name in module_names_value.split(","):
+        module_id = modules_by_name.get(module_name.strip().lower())
+        if module_id and module_id not in seen_module_ids:
+            seen_module_ids.add(module_id)
+            module_issues.append(
+                ModuleIssue(
+                    issue=issue,
+                    module_id=module_id,
+                    project_id=project_id,
+                    workspace_id=workspace_id,
+                )
+            )
+
+    if module_issues:
+        ModuleIssue.objects.bulk_create(module_issues, ignore_conflicts=True, batch_size=10)
+
+
+def _link_issue_to_cycle(issue, cycle_name_value, cycles_by_id, project_id, workspace_id):
+    if not cycle_name_value:
+        return
+
+    cycle = cycles_by_id.get(cycle_name_value.strip().lower())
+    if not cycle:
+        return
+
+    if cycle.end_date is not None and cycle.end_date < timezone.now():
+        return
+
+    CycleIssue.objects.bulk_create(
+        [
+            CycleIssue(
+                issue=issue,
+                cycle_id=cycle.id,
+                project_id=project_id,
+                workspace_id=workspace_id,
+            )
+        ],
+        ignore_conflicts=True,
+        batch_size=10,
+    )
+
+
 class IssueCsvImportEndpoint(BaseAPIView):
     @allow_permission([ROLE.ADMIN, ROLE.MEMBER])
     def post(self, request, slug, project_id):
@@ -97,6 +149,14 @@ class IssueCsvImportEndpoint(BaseAPIView):
 
         states_by_name = {state.name.lower(): state.id for state in State.objects.filter(project_id=project_id)}
         labels_by_name = {label.name.lower(): label.id for label in Label.objects.filter(project_id=project_id)}
+        modules_by_name = {
+            module.name.lower(): module.id
+            for module in Module.objects.filter(project_id=project_id, archived_at__isnull=True)
+        }
+        cycles_by_name = {
+            cycle.name.lower(): cycle
+            for cycle in Cycle.objects.filter(project_id=project_id, archived_at__isnull=True)
+        }
         members_by_email = {
             member.member.email.lower(): member.member_id
             for member in ProjectMember.objects.filter(project_id=project_id, is_active=True, role__gte=15).select_related(
@@ -171,7 +231,21 @@ class IssueCsvImportEndpoint(BaseAPIView):
             )
 
             if serializer.is_valid():
-                serializer.save()
+                issue = serializer.save()
+                _link_issue_to_modules(
+                    issue,
+                    mapped_row.get("module"),
+                    modules_by_name,
+                    project_id,
+                    project.workspace_id,
+                )
+                _link_issue_to_cycle(
+                    issue,
+                    mapped_row.get("cycle"),
+                    cycles_by_name,
+                    project_id,
+                    project.workspace_id,
+                )
                 created_count += 1
             else:
                 failed_count += 1

@@ -369,7 +369,7 @@
   "project": {
     "issues_import": {
       "title": "Import work items from CSV",
-      "description": "Upload a CSV with columns: Name (required), Description, Priority, State, Labels, Assignees, Start Date, Target Date.",
+      "description": "Upload a CSV with columns: Name (required), Description, Priority, State, Labels, Assignees, Module, Cycle, Start Date, Target Date. Leave Module or Cycle empty to skip linking.",
       "download_sample": "Download sample CSV",
       "dropzone": {
         "active": "Drop CSV file here",
