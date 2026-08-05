@@ -1,101 +1,63 @@
-# preview    → build GHCR images + deploy ngay
-# prod       → build + tag :production-candidate (chưa deploy)
-# Deploy prod → workflow Deploy (manual)
+# Một workflow: push → build GHCR → deploy VPS ngay (preview + prod).
 #
-# Secrets (chỉ 3):
-#   VPS                  — SSH dùng chung (host/user/port/private key)
-#   APP_ENV_STAGING      — DEPLOY_PATH + Plane env (preview)
-#   APP_ENV_PRODUCTION   — DEPLOY_PATH + Plane env (prod)
+# Secrets:
+#   VPS                  — SSH (host/user/port/private key)
+#   APP_ENV_STAGING      — DEPLOY_PATH + Plane env (branch preview)
+#   APP_ENV_PRODUCTION   — DEPLOY_PATH + Plane env (branch prod)
 
 name: CI/CD
 
 on:
   push:
     branches: [preview, prod]
-  pull_request:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: Env để deploy
+        type: choice
+        options: [preview, production]
+        default: preview
 
 permissions:
   contents: read
-  pull-requests: read
   packages: write
 
 env:
   REGISTRY: ghcr.io
 
 jobs:
-  changes:
+  setup:
     runs-on: ubuntu-latest
     outputs:
-      apps: ${{ steps.filter.outputs.apps }}
       environment: ${{ steps.env.outputs.environment }}
-      is_preview: ${{ steps.env.outputs.is_preview }}
+      app_env_secret: ${{ steps.env.outputs.app_env_secret }}
       image_prefix: ${{ steps.env.outputs.image_prefix }}
+      env_tag: ${{ steps.env.outputs.env_tag }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: dorny/paths-filter@v3
-        id: filter
-        with:
-          filters: |
-            apps:
-              - 'apps/**'
-              - 'packages/**'
-              - 'deploy/**'
-              - 'package.json'
-              - 'pnpm-lock.yaml'
-              - 'pnpm-workspace.yaml'
-              - 'turbo.json'
-              - '.github/workflows/ci-cd.yml'
-              - '.github/workflows/deploy.yml'
-              - '.github/scripts/**'
       - id: env
         run: |
           repo="${GITHUB_REPOSITORY,,}"
           echo "image_prefix=${REGISTRY}/${repo}" >> "$GITHUB_OUTPUT"
-          case "${{ github.ref_name }}" in
-            prod)
-              echo "environment=production" >> "$GITHUB_OUTPUT"
-              echo "is_preview=false" >> "$GITHUB_OUTPUT"
-              ;;
-            preview)
-              echo "environment=preview" >> "$GITHUB_OUTPUT"
-              echo "is_preview=true" >> "$GITHUB_OUTPUT"
-              ;;
-            *)
-              echo "environment=preview" >> "$GITHUB_OUTPUT"
-              echo "is_preview=false" >> "$GITHUB_OUTPUT"
-              ;;
-          esac
 
-  ci:
-    needs: changes
-    if: >
-      github.event_name == 'push' &&
-      (
-        needs.changes.outputs.is_preview == 'true' ||
-        needs.changes.outputs.apps == 'true'
-      )
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: pnpm/action-setup@v4
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 22
-          cache: pnpm
-      - run: pnpm install --frozen-lockfile
-      - name: Typecheck web apps
-        run: pnpm exec turbo run check:types --filter=web --filter=admin --filter=space --filter=live
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            ENV_NAME="${{ inputs.environment }}"
+          elif [ "${{ github.ref_name }}" = "prod" ]; then
+            ENV_NAME="production"
+          else
+            ENV_NAME="preview"
+          fi
+
+          echo "environment=$ENV_NAME" >> "$GITHUB_OUTPUT"
+          if [ "$ENV_NAME" = "production" ]; then
+            echo "app_env_secret=APP_ENV_PRODUCTION" >> "$GITHUB_OUTPUT"
+            echo "env_tag=prod" >> "$GITHUB_OUTPUT"
+          else
+            echo "app_env_secret=APP_ENV_STAGING" >> "$GITHUB_OUTPUT"
+            echo "env_tag=preview" >> "$GITHUB_OUTPUT"
+          fi
 
   build-push:
-    needs: [changes, ci]
-    if: >
-      always() &&
-      github.event_name == 'push' &&
-      needs.ci.result == 'success' &&
-      (
-        needs.changes.outputs.is_preview == 'true' ||
-        (github.ref == 'refs/heads/prod' && needs.changes.outputs.apps == 'true')
-      )
+    needs: setup
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -123,28 +85,19 @@ jobs:
       - uses: actions/checkout@v4
       - id: meta
         run: |
-          prefix="${{ needs.changes.outputs.image_prefix }}"
+          prefix="${{ needs.setup.outputs.image_prefix }}"
           name="${{ matrix.name }}"
-          env_name="${{ needs.changes.outputs.environment }}"
+          env_tag="${{ needs.setup.outputs.env_tag }}"
           echo "image=${prefix}/${name}:${GITHUB_SHA}" >> "$GITHUB_OUTPUT"
-          echo "env_tag=${prefix}/${name}:${env_name}" >> "$GITHUB_OUTPUT"
+          echo "env_tag=${prefix}/${name}:${env_tag}" >> "$GITHUB_OUTPUT"
           echo "latest=${prefix}/${name}:latest" >> "$GITHUB_OUTPUT"
-          if [ "$env_name" = "production" ]; then
-            echo "candidate=${prefix}/${name}:production-candidate" >> "$GITHUB_OUTPUT"
-            echo "has_candidate=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "candidate=" >> "$GITHUB_OUTPUT"
-            echo "has_candidate=false" >> "$GITHUB_OUTPUT"
-          fi
       - uses: docker/setup-buildx-action@v3
       - uses: docker/login-action@v3
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-      - name: Build and push (preview)
-        if: steps.meta.outputs.has_candidate != 'true'
-        uses: docker/build-push-action@v6
+      - uses: docker/build-push-action@v6
         with:
           context: ${{ matrix.context }}
           file: ${{ matrix.file }}
@@ -153,48 +106,46 @@ jobs:
             ${{ steps.meta.outputs.image }}
             ${{ steps.meta.outputs.env_tag }}
             ${{ steps.meta.outputs.latest }}
-          cache-from: type=gha,scope=${{ matrix.name }}
-          cache-to: type=gha,mode=max,scope=${{ matrix.name }}
-      - name: Build and push (prod + candidate)
-        if: steps.meta.outputs.has_candidate == 'true'
-        uses: docker/build-push-action@v6
-        with:
-          context: ${{ matrix.context }}
-          file: ${{ matrix.file }}
-          push: true
-          tags: |
-            ${{ steps.meta.outputs.image }}
-            ${{ steps.meta.outputs.env_tag }}
-            ${{ steps.meta.outputs.candidate }}
-            ${{ steps.meta.outputs.latest }}
+          build-args: |
+            VITE_API_BASE_URL=https://api.vngate.click
+            VITE_WEB_BASE_URL=https://vngate.click
+            VITE_ADMIN_BASE_URL=https://vngate.click
+            VITE_ADMIN_BASE_PATH=/god-mode
+            VITE_SPACE_BASE_URL=https://vngate.click
+            VITE_SPACE_BASE_PATH=/spaces
+            VITE_LIVE_BASE_URL=https://vngate.click
+            VITE_LIVE_BASE_PATH=/live
           cache-from: type=gha,scope=${{ matrix.name }}
           cache-to: type=gha,mode=max,scope=${{ matrix.name }}
 
-  deploy-preview:
-    needs: [changes, build-push]
-    if: >
-      always() &&
-      github.event_name == 'push' &&
-      needs.changes.outputs.is_preview == 'true' &&
-      needs.build-push.result == 'success'
+  deploy:
+    needs: [setup, build-push]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Load secrets (VPS + APP_ENV_STAGING)
+      - name: Load secrets
         env:
           VPS: ${{ secrets.VPS }}
-          APP_ENV: ${{ secrets.APP_ENV_STAGING }}
+          APP_ENV_STAGING: ${{ secrets.APP_ENV_STAGING }}
+          APP_ENV_PRODUCTION: ${{ secrets.APP_ENV_PRODUCTION }}
+          APP_ENV_SECRET: ${{ needs.setup.outputs.app_env_secret }}
         run: |
           set -euo pipefail
           : "${VPS:?Missing secret VPS}"
-          : "${APP_ENV:?Missing secret APP_ENV_STAGING}"
+          if [ "$APP_ENV_SECRET" = "APP_ENV_PRODUCTION" ]; then
+            APP_ENV="$APP_ENV_PRODUCTION"
+            : "${APP_ENV:?Missing secret APP_ENV_PRODUCTION}"
+          else
+            APP_ENV="$APP_ENV_STAGING"
+            : "${APP_ENV:?Missing secret APP_ENV_STAGING}"
+          fi
           printf '%s\n' "$VPS" > /tmp/vps.env
           printf '%s\n' "$APP_ENV" > /tmp/app.env
           python3 .github/scripts/split-vps-env.py /tmp/vps.env /tmp/vps
           python3 .github/scripts/split-deploy-env.py /tmp/app.env /tmp/split
-      - name: Deploy stack (preview)
+      - name: Deploy stack
         env:
-          IMAGE_PREFIX: ${{ needs.changes.outputs.image_prefix }}
+          IMAGE_PREFIX: ${{ needs.setup.outputs.image_prefix }}
           GHCR_ACTOR: ${{ github.actor }}
           GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
