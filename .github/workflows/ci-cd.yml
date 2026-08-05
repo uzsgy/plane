@@ -118,8 +118,45 @@ jobs:
           cache-from: type=gha,scope=${{ matrix.name }}
           cache-to: type=gha,mode=max,scope=${{ matrix.name }}
 
-  deploy:
+  # GHCR packages mặc định private → VPS pull bị denied.
+  # Publicize sau push để docker compose pull không phụ thuộc login token.
+  publish-packages:
     needs: [setup, build-push]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Make container packages public
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          REPO_NAME="${GITHUB_REPOSITORY#*/}"
+          for name in web admin space live backend proxy; do
+            pkg="${REPO_NAME}/${name}"
+            encoded="$(printf %s "$pkg" | jq -sRr @uri)"
+            echo "Setting visibility public: $pkg"
+            # https://docs.github.com/en/rest/packages/packages#set-visibility-for-the-authenticated-users-package
+            code="$(curl -sS -o /tmp/pkg-vis.json -w '%{http_code}' -X PUT \
+              -H "Authorization: Bearer ${GH_TOKEN}" \
+              -H "Accept: application/vnd.github+json" \
+              -H "X-GitHub-Api-Version: 2022-11-28" \
+              "https://api.github.com/user/packages/container/${encoded}/visibility" \
+              -d '{"visibility":"public"}')"
+            echo "HTTP $code — $(cat /tmp/pkg-vis.json)"
+            # 204/200 ok; 404 có thể chưa kịp index — retry một lần
+            if [ "$code" = "404" ]; then
+              sleep 5
+              curl -sS -o /tmp/pkg-vis.json -w '%{http_code}' -X PUT \
+                -H "Authorization: Bearer ${GH_TOKEN}" \
+                -H "Accept: application/vnd.github+json" \
+                -H "X-GitHub-Api-Version: 2022-11-28" \
+                "https://api.github.com/user/packages/container/${encoded}/visibility" \
+                -d '{"visibility":"public"}' || true
+              echo "retry — $(cat /tmp/pkg-vis.json)"
+            fi
+          done
+
+  deploy:
+    needs: [setup, build-push, publish-packages]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -152,26 +189,37 @@ jobs:
           set -euo pipefail
           # shellcheck disable=SC1091
           source .github/scripts/ssh-with-vps.sh /tmp/vps
-          DEPLOY_PATH="$(cat /tmp/split/deploy_path)"
+          DEPLOY_PATH="$(tr -d '\r\n' < /tmp/split/deploy_path)"
+          : "${DEPLOY_PATH:?Missing DEPLOY_PATH}"
           PREFIX="$IMAGE_PREFIX"
           SHA="$GITHUB_SHA"
 
-          ssh -p "$VPS_PORT" "$VPS_USER@$VPS_HOST" "mkdir -p $DEPLOY_PATH"
+          Q_PATH="$(printf %q "$DEPLOY_PATH")"
+          Q_ACTOR="$(printf %q "$GHCR_ACTOR")"
+          Q_TOKEN="$(printf %q "$GHCR_TOKEN")"
+          Q_WEB="$(printf %q "${PREFIX}/web:${SHA}")"
+          Q_ADMIN="$(printf %q "${PREFIX}/admin:${SHA}")"
+          Q_SPACE="$(printf %q "${PREFIX}/space:${SHA}")"
+          Q_LIVE="$(printf %q "${PREFIX}/live:${SHA}")"
+          Q_API="$(printf %q "${PREFIX}/backend:${SHA}")"
+          Q_PROXY="$(printf %q "${PREFIX}/proxy:${SHA}")"
+
+          ssh -p "$VPS_PORT" "$VPS_USER@$VPS_HOST" "mkdir -p $Q_PATH"
           scp -P "$VPS_PORT" deploy/docker-compose.yml "$VPS_USER@$VPS_HOST:$DEPLOY_PATH/docker-compose.yml"
           scp -P "$VPS_PORT" /tmp/split/plane.env "$VPS_USER@$VPS_HOST:$DEPLOY_PATH/.env"
 
-          ssh -p "$VPS_PORT" "$VPS_USER@$VPS_HOST" "
-            set -euo pipefail
-            echo $GHCR_TOKEN | docker login ghcr.io -u $GHCR_ACTOR --password-stdin
-            cd $DEPLOY_PATH
-            export WEB_IMAGE=${PREFIX}/web:${SHA}
-            export ADMIN_IMAGE=${PREFIX}/admin:${SHA}
-            export SPACE_IMAGE=${PREFIX}/space:${SHA}
-            export LIVE_IMAGE=${PREFIX}/live:${SHA}
-            export API_IMAGE=${PREFIX}/backend:${SHA}
-            export PROXY_IMAGE=${PREFIX}/proxy:${SHA}
+          ssh -p "$VPS_PORT" "$VPS_USER@$VPS_HOST" \
+            "set -euo pipefail
+            echo $Q_TOKEN | docker login ghcr.io -u $Q_ACTOR --password-stdin
+            cd $Q_PATH
+            export WEB_IMAGE=$Q_WEB
+            export ADMIN_IMAGE=$Q_ADMIN
+            export SPACE_IMAGE=$Q_SPACE
+            export LIVE_IMAGE=$Q_LIVE
+            export API_IMAGE=$Q_API
+            export PROXY_IMAGE=$Q_PROXY
             docker compose pull
             docker compose run --rm migrator
             docker compose up -d --remove-orphans
             docker image prune -f
-          "
+            "
