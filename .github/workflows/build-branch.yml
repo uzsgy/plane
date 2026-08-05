@@ -30,10 +30,12 @@ on:
         required: false
         default: false
         type: boolean
-  push:
-    branches:
-      - preview
-      - canary
+  # Auto push disabled — fork uses .github/workflows/ci-cd.yml (GHCR + VPS).
+  # Keep this workflow for manual Docker Hub / release builds only.
+  # push:
+  #   branches:
+  #     - preview
+  #     - canary
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}

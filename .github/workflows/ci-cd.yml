@@ -1,0 +1,226 @@
+# preview    → build GHCR images + deploy ngay
+# prod       → build + tag :production-candidate (chưa deploy)
+# Deploy prod → workflow Deploy (manual)
+#
+# Secrets (chỉ 3):
+#   VPS                  — SSH dùng chung (host/user/port/private key)
+#   APP_ENV_STAGING      — DEPLOY_PATH + Plane env (preview)
+#   APP_ENV_PRODUCTION   — DEPLOY_PATH + Plane env (prod)
+
+name: CI/CD
+
+on:
+  push:
+    branches: [preview, prod]
+  pull_request:
+
+permissions:
+  contents: read
+  pull-requests: read
+  packages: write
+
+env:
+  REGISTRY: ghcr.io
+
+jobs:
+  changes:
+    runs-on: ubuntu-latest
+    outputs:
+      apps: ${{ steps.filter.outputs.apps }}
+      environment: ${{ steps.env.outputs.environment }}
+      is_preview: ${{ steps.env.outputs.is_preview }}
+      image_prefix: ${{ steps.env.outputs.image_prefix }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          filters: |
+            apps:
+              - 'apps/**'
+              - 'packages/**'
+              - 'deploy/**'
+              - 'package.json'
+              - 'pnpm-lock.yaml'
+              - 'pnpm-workspace.yaml'
+              - 'turbo.json'
+              - '.github/workflows/ci-cd.yml'
+              - '.github/workflows/deploy.yml'
+              - '.github/scripts/**'
+      - id: env
+        run: |
+          repo="${GITHUB_REPOSITORY,,}"
+          echo "image_prefix=${REGISTRY}/${repo}" >> "$GITHUB_OUTPUT"
+          case "${{ github.ref_name }}" in
+            prod)
+              echo "environment=production" >> "$GITHUB_OUTPUT"
+              echo "is_preview=false" >> "$GITHUB_OUTPUT"
+              ;;
+            preview)
+              echo "environment=preview" >> "$GITHUB_OUTPUT"
+              echo "is_preview=true" >> "$GITHUB_OUTPUT"
+              ;;
+            *)
+              echo "environment=preview" >> "$GITHUB_OUTPUT"
+              echo "is_preview=false" >> "$GITHUB_OUTPUT"
+              ;;
+          esac
+
+  ci:
+    needs: changes
+    if: >
+      github.event_name == 'push' &&
+      (
+        needs.changes.outputs.is_preview == 'true' ||
+        needs.changes.outputs.apps == 'true'
+      )
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - name: Typecheck web apps
+        run: pnpm exec turbo run check:types --filter=web --filter=admin --filter=space --filter=live
+
+  build-push:
+    needs: [changes, ci]
+    if: >
+      always() &&
+      github.event_name == 'push' &&
+      needs.ci.result == 'success' &&
+      (
+        needs.changes.outputs.is_preview == 'true' ||
+        (github.ref == 'refs/heads/prod' && needs.changes.outputs.apps == 'true')
+      )
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: web
+            context: .
+            file: apps/web/Dockerfile.web
+          - name: admin
+            context: .
+            file: apps/admin/Dockerfile.admin
+          - name: space
+            context: .
+            file: apps/space/Dockerfile.space
+          - name: live
+            context: .
+            file: apps/live/Dockerfile.live
+          - name: backend
+            context: ./apps/api
+            file: apps/api/Dockerfile.api
+          - name: proxy
+            context: ./apps/proxy
+            file: apps/proxy/Dockerfile.ce
+    steps:
+      - uses: actions/checkout@v4
+      - id: meta
+        run: |
+          prefix="${{ needs.changes.outputs.image_prefix }}"
+          name="${{ matrix.name }}"
+          env_name="${{ needs.changes.outputs.environment }}"
+          echo "image=${prefix}/${name}:${GITHUB_SHA}" >> "$GITHUB_OUTPUT"
+          echo "env_tag=${prefix}/${name}:${env_name}" >> "$GITHUB_OUTPUT"
+          echo "latest=${prefix}/${name}:latest" >> "$GITHUB_OUTPUT"
+          if [ "$env_name" = "production" ]; then
+            echo "candidate=${prefix}/${name}:production-candidate" >> "$GITHUB_OUTPUT"
+            echo "has_candidate=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "candidate=" >> "$GITHUB_OUTPUT"
+            echo "has_candidate=false" >> "$GITHUB_OUTPUT"
+          fi
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build and push (preview)
+        if: steps.meta.outputs.has_candidate != 'true'
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ matrix.context }}
+          file: ${{ matrix.file }}
+          push: true
+          tags: |
+            ${{ steps.meta.outputs.image }}
+            ${{ steps.meta.outputs.env_tag }}
+            ${{ steps.meta.outputs.latest }}
+          cache-from: type=gha,scope=${{ matrix.name }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.name }}
+      - name: Build and push (prod + candidate)
+        if: steps.meta.outputs.has_candidate == 'true'
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ matrix.context }}
+          file: ${{ matrix.file }}
+          push: true
+          tags: |
+            ${{ steps.meta.outputs.image }}
+            ${{ steps.meta.outputs.env_tag }}
+            ${{ steps.meta.outputs.candidate }}
+            ${{ steps.meta.outputs.latest }}
+          cache-from: type=gha,scope=${{ matrix.name }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.name }}
+
+  deploy-preview:
+    needs: [changes, build-push]
+    if: >
+      always() &&
+      github.event_name == 'push' &&
+      needs.changes.outputs.is_preview == 'true' &&
+      needs.build-push.result == 'success'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Load secrets (VPS + APP_ENV_STAGING)
+        env:
+          VPS: ${{ secrets.VPS }}
+          APP_ENV: ${{ secrets.APP_ENV_STAGING }}
+        run: |
+          set -euo pipefail
+          : "${VPS:?Missing secret VPS}"
+          : "${APP_ENV:?Missing secret APP_ENV_STAGING}"
+          printf '%s\n' "$VPS" > /tmp/vps.env
+          printf '%s\n' "$APP_ENV" > /tmp/app.env
+          python3 .github/scripts/split-vps-env.py /tmp/vps.env /tmp/vps
+          python3 .github/scripts/split-deploy-env.py /tmp/app.env /tmp/split
+      - name: Deploy stack (preview)
+        env:
+          IMAGE_PREFIX: ${{ needs.changes.outputs.image_prefix }}
+          GHCR_ACTOR: ${{ github.actor }}
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          # shellcheck disable=SC1091
+          source .github/scripts/ssh-with-vps.sh /tmp/vps
+          DEPLOY_PATH="$(cat /tmp/split/deploy_path)"
+          PREFIX="$IMAGE_PREFIX"
+          SHA="$GITHUB_SHA"
+
+          ssh -p "$VPS_PORT" "$VPS_USER@$VPS_HOST" "mkdir -p $DEPLOY_PATH"
+          scp -P "$VPS_PORT" deploy/docker-compose.yml "$VPS_USER@$VPS_HOST:$DEPLOY_PATH/docker-compose.yml"
+          scp -P "$VPS_PORT" /tmp/split/plane.env "$VPS_USER@$VPS_HOST:$DEPLOY_PATH/.env"
+
+          ssh -p "$VPS_PORT" "$VPS_USER@$VPS_HOST" "
+            set -euo pipefail
+            echo $GHCR_TOKEN | docker login ghcr.io -u $GHCR_ACTOR --password-stdin
+            cd $DEPLOY_PATH
+            export WEB_IMAGE=${PREFIX}/web:${SHA}
+            export ADMIN_IMAGE=${PREFIX}/admin:${SHA}
+            export SPACE_IMAGE=${PREFIX}/space:${SHA}
+            export LIVE_IMAGE=${PREFIX}/live:${SHA}
+            export API_IMAGE=${PREFIX}/backend:${SHA}
+            export PROXY_IMAGE=${PREFIX}/proxy:${SHA}
+            docker compose pull
+            docker compose run --rm migrator
+            docker compose up -d --remove-orphans
+            docker image prune -f
+          "

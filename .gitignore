@@ -41,6 +41,10 @@ pnpm-debug.log*
 .env.test.local
 .env.production.local
 
+# Deploy secrets (keep *.env.example)
+/env/*.env
+!/env/*.env.example
+
 # Vercel
 .vercel
 
@@ -111,6 +115,8 @@ build/
 temp/
 scripts/
 !packages/i18n/scripts/
+!.github/scripts/
+!.github/scripts/**
 
 # i18n auto-generated types (regenerated on every build)
 packages/i18n/src/types/keys.generated.ts
